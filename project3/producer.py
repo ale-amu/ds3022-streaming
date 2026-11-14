@@ -1,4 +1,4 @@
-"""Earthquakes -> Kafka topic "quakes".
+"""Bluesky posts -> Kafka topic "bluesky_posts".
 
   python quakes_producer.py history 7   # PULL: the last 7 days from the EMSC catalogue
   python quakes_producer.py live        # PUSH: new and updated events from the EMSC WebSocket
@@ -17,15 +17,18 @@ from quixstreams import Application
 from tornado.websocket import websocket_connect
 
 BROKER = "127.0.0.1:19092"
-TOPIC = "quakes"
-FDSN_URL = "https://www.seismicportal.eu/fdsnws/event/1/query"
-WSS_URL = "wss://www.seismicportal.eu/standing_order/websocket"
+TOPIC = "bluesky_posts"
+#FDSN_URL = "https://www.seismicportal.eu/fdsnws/event/1/query"
+WSS_URL = "wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post"
+SUBSCRIBE = None      # bluesky jetstream doesnt need subscribe messages
 
 
 def send(producer, message):
     """One Kafka record per message. Key = the event id, so every
     version of the same earthquake goes to the same partition, in order."""
-    unid = message["data"]["properties"]["unid"]
+    unid = message["data"].get("did")
+    if unid is None:
+        logging.warning("No did: sent without a key")
     producer.produce(topic=TOPIC, key=unid, value=json.dumps(message))
     return unid
 
@@ -61,22 +64,29 @@ def history(producer, days):
 
 
 async def live(producer):
-    """PUSH: keep one connection open; EMSC sends each new or updated event."""
-    ws = await websocket_connect(WSS_URL, ping_interval=15)
-    logging.info("Connected. Waiting for earthquakes (often about one a minute)...")
+    """PUSH over a WebSocket, with a reconnect loop."""
+    sent = 0
     while True:
-        text = await ws.read_message()
-        if text is None:
-            logging.warning("The server closed the connection")
-            break
         try:
-            message = json.loads(text)
-            unid = send(producer, message)
-            p = message["data"]["properties"]
-            logging.info("%-7s %s  M%s  %s", message.get("action"), unid, p.get("mag"), p.get("flynn_region"))
-        except (ValueError, KeyError, TypeError) as e:
-            logging.warning("Skipped a message I could not read: %r", e)
-
+            ws = await websocket_connect(WSS_URL, ping_interval=15)
+            logging.info("Connected. Sending posts to %s", TOPIC)
+            if SUBSCRIBE:
+                await ws.write_message(json.dumps(SUBSCRIBE))
+            while True:
+                text = await ws.read_message()
+                if text is None:
+                    break
+                try:
+                    send(producer, {"action": "live", "data": json.loads(text)})
+                    sent += 1
+                    if sent % 1000 == 0:
+                        logging.info("%d messages sent", sent)
+                except (ValueError, KeyError, TypeError, AttributeError) as e:
+                    logging.warning("Skipped a message: %r", e)
+        except Exception as e:
+            logging.warning("Connection failed: %r", e)
+        logging.info("Reconnecting in 5 s")
+        await asyncio.sleep(5)
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "live"
